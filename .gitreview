@@ -1,4 +1,6 @@
 [gerrit]
-host=review.openstack.org
+host=teamforge.schneider-electric
 port=29418
-project=openstack-infra/git-review.git
+defaultbranch=se-master
+defaultremote=origin
+project=esf_git_review

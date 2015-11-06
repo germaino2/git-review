@@ -594,11 +594,23 @@ def query_reviews_over_ssh(remote_url, change=None, current_patch_set=True,
     (hostname, username, port, project_name) = \
         parse_gerrit_ssh_params_from_git_url(remote_url)
 
+    match=None
+    if change is not None:
+        sha1_re = r'''(?x)                # verbose regexp
+                    ([0-9a-f]{40}) # SHA1'''
+        match = re.search(sha1_re, change)
+
     if change:
         if current_patch_set:
-            query = "--current-patch-set change:%s" % change
+            if match is not None:
+                query = "--current-patch-set %s" % change
+            else:
+                query = "--current-patch-set change:%s" % change
         else:
-            query = "--patch-sets change:%s" % change
+            if match is not None:
+                query = "--patch-sets %s" % change
+            else:
+                query = "--patch-sets change:%s" % change
     else:
         query = "project:%s status:open" % project_name
 
@@ -868,6 +880,7 @@ def get_branch_name(target_branch):
 
 
 def assert_one_change(remote, branch, yes, have_hook):
+
     if check_use_color_output():
         use_color = "--color=always"
     else:
@@ -1088,8 +1101,17 @@ class BranchTrackingMismatch(GitReviewException):
     "Branch exists but is tracking unexpected branch"
     EXIT_CODE = 70
 
+class GitShowBranchFailed(CommandFailed):
+    "Cannot run git show-branch"
+    EXIT_CODE = 72
+
+class GitRevListFailed(CommandFailed):
+    "Cannot run git rev-list"
+    EXIT_CODE = 73
+
 
 def fetch_review(review, masterbranch, remote):
+
     remote_url = get_remote_url(remote)
 
     review_arg = review
@@ -1138,6 +1160,89 @@ def fetch_review(review, masterbranch, remote):
     run_command_exc(PatchSetGitFetchFailed,
                     "git", "fetch", remote, refspec)
     return branch_name, remote_branch
+
+
+def rebase_review(branch_name, remote, remote_branch, review):
+
+    # Rebase master branch to make sure that we get merge commit we may depend
+    run_command_exc(PatchSetGitFetchFailed, "git", "fetch", remote, remote_branch)
+
+    # Find earlier N-way branches ancestor between master and the review branch
+    cmd = "git show-branch --merge-base --topo-order %s %s/%s" % (branch_name, remote, remote_branch)
+    base = run_command_exc(GitShowBranchFailed, cmd)
+
+    # Get list of commit to rebase
+    cmd = ["git", "rev-list", "--reverse", "%s...%s" % (base, branch_name)]
+    commit_list = run_command_exc(GitRevListFailed, *cmd)
+
+    # Get commit pointed by FETCH_HEAD
+    cmd = "git log -1 --pretty=%H FETCH_HEAD"
+    (status, fetch_head_commit) = run_command_status(cmd)
+    if status != 0:
+        raise CommandFailed(status, output, cmd, {})
+
+    if base != fetch_head_commit:
+        first_time = 0
+        run_command_exc(CheckoutNewBranchFailed, "git", "checkout", "FETCH_HEAD")
+    else:
+        first_time = 1
+
+
+    # checkout master HEAD
+    #run_command_exc(CheckoutNewBranchFailed, "git", "checkout", "FETCH_HEAD")
+
+    for commit in commit_list.splitlines():
+        remote_url = get_remote_url(remote)
+
+        review_arg = review
+        review, patchset_number = parse_review_number(review)
+        current_patch_set = patchset_number is None
+
+        # Query change number from commit
+        review_infos = query_reviews(remote_url,
+                            change=commit,
+                            current_patch_set=current_patch_set,
+                            exception=CannotQueryPatchSet,
+                            parse_exc=ReviewInformationNotFound)
+
+        review_info = review_infos[0]
+
+        #print (review_info)
+        status = review_info['status']
+
+        if status is None:
+            print('Commit %s was not handled in review, assuming already available on %s' % (commit, remote_branch))
+        else:
+            if status == "NEW":
+                rebase_commit = review_info['currentPatchSet']['revision']
+                rebase_refspec = review_info['currentPatchSet']['ref']
+                if rebase_commit != commit:
+                    if first_time == 1:
+                        run_command_exc(PatchSetGitFetchFailed, "git", "fetch", remote, rebase_refspec)
+                        run_command_exc(CheckoutNewBranchFailed, "git", "checkout", rebase_commit)
+                        first_time = 0
+                    else:
+                        run_command_exc(PatchSetGitFetchFailed, "git", "fetch", remote, rebase_refspec)
+                        cherrypick_review()
+                else:
+                    if first_time == 0:
+                        run_command_exc(PatchSetGitFetchFailed, "git", "fetch", remote, rebase_refspec)
+                        cherrypick_review()
+
+            else:
+                cmd = ["git", "log", "-1 --pretty=%H", "%s" % (commit)]
+                (status, output) = run_command_status(*cmd)
+                if status != 0:
+                    raise CommandFailed(status, output, cmd, {})
+
+        if first_time == 0:
+            # Get current commit SHA1
+            cmd = "git log -1 --pretty=%H"
+            (status, output) = run_command_status(cmd)
+            cmd = "git update-ref refs/heads/%s %s" %(branch_name, output)
+            (status, output) = run_command_status(cmd)
+            cmd = "git checkout %s" %(branch_name)
+            (status, output) = run_command_status(cmd)
 
 
 def checkout_review(branch_name, remote, remote_branch):
@@ -1466,6 +1571,7 @@ def _main():
         set_color_output(options.color)
 
     if options.changeidentifier:
+
         if options.compare:
             compare_review(options.changeidentifier,
                            branch, remote, options.rebase)
@@ -1474,6 +1580,8 @@ def _main():
                                                    branch, remote)
         if options.download:
             checkout_review(local_branch, remote, remote_branch)
+            if options.rebase or options.force_rebase:
+                rebase_review(local_branch, remote, remote_branch,options.changeidentifier)
         else:
             if options.cherrypickcommit:
                 cherrypick_review()
@@ -1485,6 +1593,7 @@ def _main():
     elif options.list:
         list_reviews(remote)
         return
+
 
     if options.custom_script:
         run_custom_script("pre")
